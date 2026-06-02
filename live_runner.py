@@ -43,6 +43,7 @@ FIELD = [
     # Real Round 1 entrants (NOT house bots) — scored on the same live window.
     ("opu_agent.py",                 "opu",                    "round 1 · entrant"),
     ("robert_agent.py",              "robert",                 "round 1 · entrant"),
+    ("mohit_agent.py",               "mohit",                  "round 1 · entrant"),
 ]
 
 EVAL_DAYS = 60       # (history sizing only) trailing window used when fetching bars
