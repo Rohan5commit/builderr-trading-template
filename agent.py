@@ -63,6 +63,7 @@ MAX_WEIGHT = 0.24
 DRIFT_LIMIT = 0.27
 MAX_BETA_GROSS = 1.35
 MIN_TRADE_PCT = 0.015
+MIN_CONFIDENCE = 0.30
 
 _last_rebalance_bar_date: str | None = None
 _last_targets: dict[str, float] = {}
@@ -202,6 +203,43 @@ def _normalize_nim_response(resp: dict) -> dict:
     """Normalize regime names from 8B model to canonical form."""
     if not resp:
         return resp
+    regime = resp.get("regime", "")
+    resp["regime"] = _REGIME_MAP.get(regime.upper().replace(" ", "_"), regime)
+    action = resp.get("action", "HOLD").upper()
+    if action not in ("BUY", "SELL", "HOLD"):
+        action = "HOLD"
+    resp["action"] = action
+    try:
+        resp["confidence"] = max(0.0, min(1.0, float(resp.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        resp["confidence"] = 0.5
+    return resp
+
+
+def compute_agreement_score(nim_regime: str, features: dict) -> float:
+    """Score 0.0–1.0: how well NIM regime aligns with deterministic signals.
+
+    Use this instead of raw NIM confidence for position sizing.
+    Raw LLM confidence is meaningless (0.80 for both correct and wrong calls).
+    Agreement score measures whether the features actually support the regime label.
+    """
+    z20 = features.get("spy_zscore", 0)
+    ret20 = features.get("spy_rolling_return_20", 0)
+    mom5 = features.get("spy_momentum", {}).get("short", 0)
+    vol20 = features.get("spy_volatility", 0)
+    dd = features.get("spy_drawdown", 0)
+
+    if nim_regime == "TREND_UP":
+        return min(1.0, max(0.0, ret20 * 10 + (z20 / 3) - vol20 * 20))
+    if nim_regime == "TREND_DOWN":
+        return min(1.0, max(0.0, -ret20 * 8 + dd * 3 + vol20 * 15))
+    if nim_regime == "MEAN_REVERT_UP":
+        return min(1.0, max(0.0, (-z20 / 2) + (mom5 + 0.01) * 30))
+    if nim_regime == "MEAN_REVERT_DOWN":
+        return min(1.0, max(0.0, (z20 / 3) + ret20 * 8))
+    if nim_regime == "CHOP":
+        return min(1.0, max(0.0, 0.8 - abs(ret20) * 10 - abs(z20) * 0.3))
+    return 0.3
     regime = resp.get("regime", "")
     resp["regime"] = _REGIME_MAP.get(regime.upper().replace(" ", "_"), regime)
     action = resp.get("action", "HOLD").upper()
@@ -615,6 +653,8 @@ def decide(
     # --- Layer 2: NIM regime overlay (optional, hard timeout) ---
     nim_regime = None
     nim_action = None
+    nim_confidence = 0.5
+    effective_confidence = 0.0
     nim_start = time.time()
     nim_prompt = _build_nim_prompt(market_state)
     if nim_prompt:
@@ -623,11 +663,13 @@ def decide(
             nim_result = _normalize_nim_response(nim_result)
             nim_regime = nim_result.get("regime")
             nim_action = nim_result.get("action")
+            nim_confidence = nim_result.get("confidence", 0.5)
         else:
             # NIM failed — use deterministic fallback instead of blind CHOP/HOLD
             fb = _deterministic_fallback(market_state)
             nim_regime = fb.get("regime")
             nim_action = fb.get("action")
+            nim_confidence = fb.get("confidence", 0.5)
     nim_elapsed = time.time() - nim_start
 
     # If NIM took too long or we're close to deadline, skip NIM enhancement
@@ -655,6 +697,27 @@ def decide(
         _z20 = (spy_closes_list[-1] - _mu) / _sigma if _sigma > 0 else 0.0
         _peak = max(spy_closes_list)
         _dd = (_peak - spy_closes_list[-1]) / _peak if _peak > 0 else 0.0
+        _rets = [(spy_closes_list[i] / spy_closes_list[i-1] - 1.0) for i in range(-20, 0)] if len(spy_closes_list) >= 21 else []
+        _vol20 = pstdev(_rets) if len(_rets) > 1 else 0.0
+
+        # Build features dict for agreement scoring
+        _features = {
+            "spy_zscore": _z20,
+            "spy_rolling_return_20": _ret20,
+            "spy_momentum": {"short": _mom5},
+            "spy_volatility": _vol20,
+            "spy_drawdown": _dd,
+        }
+
+        # Compute agreement score — how well NIM regime matches features
+        if nim_regime:
+            agreement = compute_agreement_score(nim_regime, _features)
+            effective_confidence = 0.3 * nim_confidence + 0.7 * agreement
+
+            # Gate: skip NIM overlay if agreement is too low
+            if effective_confidence < MIN_CONFIDENCE:
+                nim_regime = None
+                nim_action = None
 
         # MEAN_REVERT_UP: override model if it says TREND_DOWN but mom5 shows bounce
         if _z20 < -1.5 and -0.12 <= _ret20 <= -0.03 and _mom5 > -0.01:
@@ -687,9 +750,11 @@ def decide(
         # NIM sees oversold bounce — keep risk-on, don't flip to defensive
         pass  # targets remain as-is from deterministic layer
     elif nim_regime == "CHOP":
-        # Choppy market — reduce position sizes by 20%
+        # Choppy market — reduce position sizes proportional to confidence
+        # Higher effective_confidence = more reduction (trust the CHOP call)
         if targets:
-            targets = {t: w * 0.8 for t, w in targets.items()}
+            chop_factor = 1.0 - (0.3 * effective_confidence)
+            targets = {t: w * chop_factor for t, w in targets.items()}
             targets = _scale_caps(targets)
 
     if not targets:
