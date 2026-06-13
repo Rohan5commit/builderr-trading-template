@@ -79,13 +79,25 @@ Output format (nothing else):
 Regimes: TREND_UP, TREND_DOWN, MEAN_REVERT_UP, MEAN_REVERT_DOWN, CHOP
 Actions: BUY, SELL, HOLD (long-only: SELL closes existing longs)
 
-Rules:
+Rules (match FIRST whose conditions are met):
 - MEAN_REVERT_UP: z20 < -1.5 AND ret20 between -0.12 and -0.03 AND mom5 > -0.01 → BUY
 - MEAN_REVERT_DOWN: z20 > 2.5 AND ret20 > 0.05 → HOLD
-- TREND_DOWN: ret20 < -0.05 AND vol20 > 0.025 AND z20 < -1.5 → SELL or HOLD, NEVER BUY
+- TREND_DOWN: ret20 < -0.05 AND vol20 > 0.025 AND z20 < -1.5 AND dd > 0.10 AND mom5 < -0.03 → SELL or HOLD, NEVER BUY
 - TREND_UP: ret20 > 0.03 AND vol20 < 0.02 AND z20 > 1.5 → BUY
 - CHOP: abs(ret20) < 0.01 AND abs(z20) < 0.5 → HOLD
 - If confidence < 0.4 → HOLD
+
+CRITICAL DISAMBIGUATION — MEAN_REVERT_UP vs TREND_DOWN:
+Both show negative z20 and negative ret20. Use these rules in order:
+
+IF z20 < -1.5 AND ret20 is between -0.03 and -0.12:
+  - mom5 > -0.01 → This is MEAN_REVERT_UP. Price decline has stabilized. BUY.
+  - mom5 < -0.03 AND dd > 0.10 → This is TREND_DOWN. Decline accelerating. SELL/HOLD.
+  - If ambiguous: prefer MEAN_REVERT_UP when mom5 > -0.02 and dd < 0.08
+
+A stock that fell 8% over 20 days but is flat/up over the last 5 days
+is bouncing from support = MEAN_REVERT_UP, NOT TREND_DOWN.
+TREND_DOWN requires CONTINUED deterioration (mom5 negative, dd > 10%).
 """
 
 
@@ -268,6 +280,15 @@ def _build_nim_prompt(market_state: dict) -> str | None:
         parts.append(f"QQQ: last={qqq_closes[-1]:.2f}, vol20={qqq_vol:.4f}, mom5={qqq_mom5:.4f}")
 
     parts.append("Portfolio: equity=100000, cash%=0.50, positions=0")
+
+    # Pre-label regime hint to guide the model
+    if z20 < -1.5 and mom5 > -0.01:
+        parts.append("Regime_hint: OVERSOLD_BOUNCE_POSSIBLE — mom5 suggests stabilization")
+    elif z20 < -1.5 and mom5 < -0.03:
+        parts.append("Regime_hint: CONTINUED_DECLINE — mom5 confirms downtrend")
+    elif z20 > 2.5 and ret20 > 0.05:
+        parts.append("Regime_hint: OVERBOUGHT_EXHAUSTION")
+
     return "\n".join(parts)
 
 
@@ -579,6 +600,36 @@ def decide(
     if nim_elapsed > 3.5:
         nim_regime = None
         nim_action = None
+
+    # --- DETERMINISTIC REGIME OVERRIDE: correct model misclassifications ---
+    spy_bars = market_state.get("SPY", [])
+    spy_closes_list = []
+    for b in spy_bars:
+        try:
+            c = float(b["close"])
+            if c > 0:
+                spy_closes_list.append(c)
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if len(spy_closes_list) >= 21:
+        _ret20 = spy_closes_list[-1] / spy_closes_list[-21] - 1.0
+        _mom5 = (spy_closes_list[-1] / spy_closes_list[-6] - 1.0) if len(spy_closes_list) >= 6 else 0.0
+        _window = spy_closes_list[-20:]
+        _mu = mean(_window)
+        _sigma = pstdev(_window) if len(_window) > 1 else 0.0001
+        _z20 = (spy_closes_list[-1] - _mu) / _sigma if _sigma > 0 else 0.0
+        _peak = max(spy_closes_list)
+        _dd = (_peak - spy_closes_list[-1]) / _peak if _peak > 0 else 0.0
+
+        # MEAN_REVERT_UP: override model if it says TREND_DOWN but mom5 shows bounce
+        if _z20 < -1.5 and -0.12 <= _ret20 <= -0.03 and _mom5 > -0.01:
+            nim_regime = "MEAN_REVERT_UP"
+            nim_action = "BUY"
+        # TREND_DOWN: override model if it says MEAN_REVERT_UP but decline is accelerating
+        if _ret20 < -0.05 and _z20 < -1.5 and _dd > 0.10 and _mom5 < -0.03:
+            nim_regime = "TREND_DOWN"
+            nim_action = "SELL" if portfolio_state.get("positions") else "HOLD"
 
     # --- Layer 1: Deterministic Calmar Rotation Hybrid ---
     days_since = _days_since_rebalance(market_state)
