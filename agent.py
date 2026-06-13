@@ -578,6 +578,40 @@ def decide(
 
     total_equity = equity(portfolio_state, cash)
 
+    # --- HARD CRASH GUARD: sell immediately, bypass NIM entirely ---
+    # For clear crash regimes, don't wait for NIM latency. Sell now.
+    _spy_bars = market_state.get("SPY", [])
+    _spy_cs = []
+    for _b in _spy_bars:
+        try:
+            _c = float(_b["close"])
+            if _c > 0:
+                _spy_cs.append(_c)
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(_spy_cs) >= 21:
+        _r20 = _spy_cs[-1] / _spy_cs[-21] - 1.0
+        _z = 0.0
+        _w = _spy_cs[-20:]
+        _mu = mean(_w)
+        _sig = pstdev(_w) if len(_w) > 1 else 0.0001
+        _z = (_spy_cs[-1] - _mu) / _sig if _sig > 0 else 0.0
+        _ret_s = [(_spy_cs[i] / _spy_cs[i-1] - 1.0) for i in range(-20, 0)]
+        _vol = pstdev(_ret_s) if len(_ret_s) > 1 else 0.0
+        _pk = max(_spy_cs)
+        _dd = (_pk - _spy_cs[-1]) / _pk if _pk > 0 else 0.0
+
+        if _r20 < -0.15 and _z < -1.5 and _vol > 0.015:
+            # Clear crash — sell all positions immediately
+            _positions = portfolio_state.get("positions", [])
+            _orders = []
+            for _p in _positions:
+                _qty = int(float(_p.get("quantity", 0)))
+                if _qty > 0:
+                    _orders.append({"ticker": _p["ticker"], "side": "sell", "quantity": _qty})
+            if _orders:
+                return _orders
+
     # --- Layer 2: NIM regime overlay (optional, hard timeout) ---
     nim_regime = None
     nim_action = None
