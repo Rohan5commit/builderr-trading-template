@@ -33,8 +33,8 @@ from typing import Any
 
 NIM_API_KEY = os.environ.get("NVIDIA_NIM_API_KEY", "")
 NIM_BASE_URL = os.environ.get("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
-NIM_MODEL = os.environ.get("NVIDIA_NIM_MODEL", "meta/llama-3.3-70b-instruct")
-NIM_TIMEOUT = 4.0  # must leave margin for 5s decide() limit
+NIM_MODEL = os.environ.get("NVIDIA_NIM_MODEL", "meta/llama-3.1-8b-instruct")
+NIM_TIMEOUT = 4.0  # hard 4s ceiling — must leave margin for 5s decide() limit
 
 # ---------------------------------------------------------------------------
 # Strategy Constants (Calmar Rotation Hybrid)
@@ -71,44 +71,21 @@ _last_targets: dict[str, float] = {}
 # NIM Inference
 # ---------------------------------------------------------------------------
 
-NIM_SYSTEM_PROMPT = """You are a quantitative trading regime analyst. Given a structured market state vector, classify the current regime and recommend a trading action.
+NIM_SYSTEM_PROMPT = """Classify the market regime and return ONLY a JSON object, no other text.
 
-Output ONLY valid JSON matching this exact schema:
-{
-  "regime": "TREND_UP | TREND_DOWN | MEAN_REVERT_UP | MEAN_REVERT_DOWN | CHOP",
-  "confidence": 0.0 to 1.0,
-  "action": "BUY | SELL | HOLD",
-  "rationale": "short string explaining reasoning"
-}
+Output format (nothing else):
+{"regime":"TREND_UP","action":"BUY","confidence":0.7}
 
-REGIME CLASSIFICATION — match the FIRST rule whose conditions are met:
+Regimes: TREND_UP, TREND_DOWN, MEAN_REVERT_UP, MEAN_REVERT_DOWN, CHOP
+Actions: BUY, SELL, HOLD (long-only: SELL closes existing longs)
 
-RULE 1 — MEAN_REVERT_UP (oversold bounce):
-  z20 < -1.5 AND ret20 between -0.04 and -0.12 AND mom5 > -0.01
-  → regime=MEAN_REVERT_UP, action=BUY
-
-RULE 2 — MEAN_REVERT_DOWN (overbought exhaustion):
-  z20 > 2.5 AND ret20 > 0.05 AND cash% < 0.15
-  → regime=MEAN_REVERT_DOWN, action=HOLD
-
-RULE 3 — TREND_DOWN (sustained decline):
-  ret20 < -0.05 AND vol20 > 0.025 AND z20 < -1.5 AND dd > 0.10
-  → regime=TREND_DOWN, action=SELL or HOLD. NEVER BUY.
-
-RULE 4 — TREND_UP (sustained advance):
-  ret20 > 0.03 AND vol20 < 0.02 AND z20 > 1.5 AND dd < 0.02
-  → regime=TREND_UP, action=BUY
-
-RULE 5 — CHOP (no edge):
-  abs(ret20) < 0.01 AND abs(z20) < 0.5
-  → regime=CHOP, action=HOLD
-
-If no rule matches, use best judgment but default to HOLD.
-
-RULES:
-- LONG-ONLY: SELL means closing an existing long position, never short-selling.
-- Never BUY in TREND_DOWN or MEAN_REVERT_DOWN
-- If confidence < 0.4: action = HOLD
+Rules:
+- MEAN_REVERT_UP: z20 < -1.5 AND ret20 between -0.12 and -0.03 AND mom5 > -0.01 → BUY
+- MEAN_REVERT_DOWN: z20 > 2.5 AND ret20 > 0.05 → HOLD
+- TREND_DOWN: ret20 < -0.05 AND vol20 > 0.025 AND z20 < -1.5 → SELL or HOLD, NEVER BUY
+- TREND_UP: ret20 > 0.03 AND vol20 < 0.02 AND z20 > 1.5 → BUY
+- CHOP: abs(ret20) < 0.01 AND abs(z20) < 0.5 → HOLD
+- If confidence < 0.4 → HOLD
 """
 
 
@@ -122,8 +99,8 @@ def _call_nim(prompt: str) -> dict | None:
             {"role": "system", "content": NIM_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.1,
-        "max_tokens": 200,
+        "temperature": 0.0,
+        "max_tokens": 120,
     }).encode("utf-8")
     req = urllib.request.Request(
         f"{NIM_BASE_URL}/chat/completions",
@@ -152,6 +129,78 @@ def _call_nim(prompt: str) -> dict | None:
             return json.loads(content)
     except Exception:
         return None
+
+
+def _deterministic_fallback(market_state: dict) -> dict:
+    """Pure Python regime classification when NIM times out."""
+    spy_bars = market_state.get("SPY", [])
+    closes_list = []
+    for b in spy_bars:
+        try:
+            c = float(b["close"])
+            if c > 0:
+                closes_list.append(c)
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if len(closes_list) < 21:
+        return {"regime": "CHOP", "action": "HOLD", "confidence": 0.50}
+
+    ret20 = (closes_list[-1] / closes_list[-21] - 1.0) if len(closes_list) >= 21 else 0.0
+    mom5 = (closes_list[-1] / closes_list[-6] - 1.0) if len(closes_list) >= 6 else 0.0
+
+    if len(closes_list) >= 21:
+        rets = [(closes_list[i] / closes_list[i-1] - 1.0) for i in range(-20, 0)]
+        vol20 = pstdev(rets) if len(rets) > 1 else 0.0
+    else:
+        vol20 = 0.0
+
+    if len(closes_list) >= 20:
+        window = closes_list[-20:]
+        mu = mean(window)
+        sigma = pstdev(window) if len(window) > 1 else 0.0001
+        z20 = (closes_list[-1] - mu) / sigma if sigma > 0 else 0.0
+    else:
+        z20 = 0.0
+
+    peak = max(closes_list) if closes_list else 1.0
+    dd = (peak - closes_list[-1]) / peak if peak > 0 else 0.0
+
+    if z20 < -1.5 and -0.12 <= ret20 <= -0.03 and mom5 > -0.01:
+        return {"regime": "MEAN_REVERT_UP", "action": "BUY", "confidence": 0.60}
+    if z20 > 2.5 and ret20 > 0.05:
+        return {"regime": "MEAN_REVERT_DOWN", "action": "HOLD", "confidence": 0.65}
+    if ret20 < -0.05 and vol20 > 0.025 and z20 < -1.5 and dd > 0.10:
+        return {"regime": "TREND_DOWN", "action": "SELL", "confidence": 0.70}
+    if ret20 > 0.03 and vol20 < 0.02 and z20 > 1.5:
+        return {"regime": "TREND_UP", "action": "BUY", "confidence": 0.65}
+    return {"regime": "CHOP", "action": "HOLD", "confidence": 0.55}
+
+
+_REGIME_MAP = {
+    "BEARISH": "TREND_DOWN", "DOWN": "TREND_DOWN", "DECLINE": "TREND_DOWN",
+    "BULLISH": "TREND_UP", "UP": "TREND_UP", "ADVANCE": "TREND_UP",
+    "OVERSOLD": "MEAN_REVERT_UP", "BOUNCE": "MEAN_REVERT_UP",
+    "OVERBOUGHT": "MEAN_REVERT_DOWN", "EXHAUSTION": "MEAN_REVERT_DOWN",
+    "RANGE_BOUND": "CHOP", "SIDEWAYS": "CHOP", "NEUTRAL": "CHOP",
+}
+
+
+def _normalize_nim_response(resp: dict) -> dict:
+    """Normalize regime names from 8B model to canonical form."""
+    if not resp:
+        return resp
+    regime = resp.get("regime", "")
+    resp["regime"] = _REGIME_MAP.get(regime.upper().replace(" ", "_"), regime)
+    action = resp.get("action", "HOLD").upper()
+    if action not in ("BUY", "SELL", "HOLD"):
+        action = "HOLD"
+    resp["action"] = action
+    try:
+        resp["confidence"] = max(0.0, min(1.0, float(resp.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        resp["confidence"] = 0.5
+    return resp
 
 
 def _build_nim_prompt(market_state: dict) -> str | None:
@@ -516,8 +565,14 @@ def decide(
     if nim_prompt:
         nim_result = _call_nim(nim_prompt)
         if nim_result and isinstance(nim_result, dict):
+            nim_result = _normalize_nim_response(nim_result)
             nim_regime = nim_result.get("regime")
             nim_action = nim_result.get("action")
+        else:
+            # NIM failed — use deterministic fallback instead of blind CHOP/HOLD
+            fb = _deterministic_fallback(market_state)
+            nim_regime = fb.get("regime")
+            nim_action = fb.get("action")
     nim_elapsed = time.time() - nim_start
 
     # If NIM took too long or we're close to deadline, skip NIM enhancement
